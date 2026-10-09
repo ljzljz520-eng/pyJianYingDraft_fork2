@@ -12,6 +12,11 @@ from .metadata import FilterType, FontType, GroupAnimationType, IntroType, MaskT
 from .metadata import TextIntro, TextLoopAnim, TextOutro, TransitionType
 from .metadata import VideoCharacterEffectType, VideoSceneEffectType
 from .script_file import ScriptFile
+from .exceptions import ReferenceInvariantError
+from .ref_graph import (
+    RefGraph, RefReport, Violation as RefViolation,
+    build_ref_graph, fix_content, validate_content,
+)
 from .template_mode import ExtendMode, ShrinkMode
 from .text_segment import TextBackground, TextBorder, TextSegment, TextShadow, TextStyle
 from .time_util import SEC, Timerange, tim, trange, trange_seconds
@@ -63,6 +68,13 @@ __all__ = [
     "ExtendMode",
     "ScriptFile",
     "DraftFolder",
+    "RefGraph",
+    "RefReport",
+    "RefViolation",
+    "ReferenceInvariantError",
+    "build_ref_graph",
+    "validate_content",
+    "fix_content",
     "SEC",
     "tim",
     "trange",

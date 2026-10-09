@@ -4,11 +4,13 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from . import assets
+from . import exceptions
 from . import util
 from ._script_file_segments import _ScriptFileSegmentOps
 from ._script_file_template import _ScriptFileTemplateOps
 from ._script_file_tracks import _ScriptFileTrackOps
 from .draft_content_loader import FallbackLoader, load_draft_content
+from .ref_graph import RefReport, Violation, fix_content, validate_content
 from .script_material import ScriptMaterial
 from .template_mode import ImportedTrack, import_track
 from .track import BaseTrack, Track
@@ -106,8 +108,8 @@ class ScriptFile(_ScriptFileTrackOps, _ScriptFileSegmentOps, _ScriptFileTemplate
 
         return obj
 
-    def dumps(self) -> str:
-        """将草稿文件内容导出为JSON字符串"""
+    def _build_export_content(self) -> Dict[str, Any]:
+        """收集素材与轨道, 生成最终导出的草稿内容 dict (不进行 JSON 序列化)"""
         self.content["fps"] = self.fps
         self.content["duration"] = self.duration
         self.content["config"]["maintrack_adsorb"] = self.maintrack_adsorb
@@ -132,12 +134,149 @@ class ScriptFile(_ScriptFileTrackOps, _ScriptFileSegmentOps, _ScriptFileTemplate
 
         self.content["tracks"] = track_exports
 
-        return json.dumps(self.content, ensure_ascii=False, indent=4)
+        return self.content
 
-    def dump(self, file_path: str) -> None:
-        """将草稿文件内容写入文件"""
+    def check_references(
+        self,
+        *,
+        fix: bool = False,
+        drop_dangling: bool = False,
+        rename: Optional[Dict[str, str]] = None,
+        layer_convention: bool = True,
+    ) -> RefReport:
+        """序列化前建立类型化引用图并校验全部不变量
+
+        校验内容: 全局 ID 唯一性、允许边类型、资源可达性、环、render_index、
+        轨道顺序。报告中的每个违规带有精确 JSONPath、最小冲突子图及可选安全修复。
+
+        Args:
+            fix (`bool`): 是否应用安全修复 (重复 ID 去重并同步重写所有边、
+                render_index 重写; 不删除任何不可达资源)
+            drop_dangling (`bool`): 与`fix`配合, 移除悬空引用 (默认不移除)
+            rename (`Dict[str, str]`, optional): 与`fix`配合, 显式 ID 改名,
+                形如 {old_id: new_id}, 所有指向该 ID 的边会被同时重写
+            layer_convention (`bool`): 是否检查轨道层级约定 (warning)
+
+        Raises:
+            `ValueError`: 提供了`rename`但未启用`fix`, 或 rename 参数非法
+
+        Note:
+            `fix=True` 的修复 (ID 去重/边重写) 作用于本次导出的内容 dict,
+            不会回写到 segment/material 对象; 若随后重新调用无参数的`dumps()`,
+            冲突会重新出现。需要"修复并落盘"时请使用
+            `dump(path, validate=True, fix=True)` 或
+            `dumps(validate=True, fix=True)`, 在同一序列化管道内闭环。
+            track_order 并列修复属于对象状态修复, 会直接生效。
+
+        Returns:
+            `RefReport`: 校验报告
+        """
+        if rename is not None and not fix:
+            raise ValueError("rename 仅能与 fix=True 一起使用")
+
+        # 对象层轨道顺序不变量: 检查 track_order 是否有并列
+        order_groups: Dict[int, List[BaseTrack]] = {}
+        for track in self._list_all_tracks_in_order():
+            order_groups.setdefault(track.track_order, []).append(track)
+        tied_tracks: List[BaseTrack] = [
+            track for group in order_groups.values() if len(group) > 1 for track in group
+        ]
+        order_fixed = False
+        if tied_tracks and fix:
+            self._reindex_track_orders(self._list_all_tracks_in_order())
+            order_fixed = True
+
+        content = self._build_export_content()
+
+        if fix:
+            report = fix_content(
+                content, rename=rename, drop_dangling=drop_dangling,
+                layer_convention=layer_convention,
+            )
+        else:
+            report = validate_content(content, layer_convention=layer_convention)
+
+        # 追加轨道顺序不变量结果 (路径来自已导出的 tracks 数组)
+        if tied_tracks and not order_fixed:
+            path_by_id = {
+                track.get("id"): f"$.tracks[{i}]"
+                for i, track in enumerate(content.get("tracks", []))
+                if isinstance(track, dict)
+            }
+            report.append(Violation(
+                code="track_order_conflict", severity="warning",
+                message="存在 track_order 并列的轨道, 导出顺序依赖稳定排序, 可能与预期不一致",
+                paths=[path_by_id[t.track_id] for t in tied_tracks if t.track_id in path_by_id],
+                subgraph={
+                    "nodes": [
+                        {
+                            "id": t.track_id,
+                            "type": f"track:{t.track_type.name}",
+                            "path": path_by_id.get(t.track_id, ""),
+                        }
+                        for t in tied_tracks
+                    ],
+                    "edges": [],
+                },
+                fix_available=True,
+                fix={"kind": "reindex_track_order"},
+            ))
+        elif order_fixed:
+            report.append(Violation(
+                code="track_order_reindexed", severity="info",
+                message="检测到 track_order 并列, 已按当前顺序重新编号为 0..n-1",
+                paths=[],
+                subgraph={"nodes": [], "edges": []},
+            ))
+
+        return report
+
+    def dumps(
+        self,
+        *,
+        validate: bool = False,
+        fix: bool = False,
+        drop_dangling: bool = False,
+    ) -> str:
+        """将草稿文件内容导出为JSON字符串
+
+        Args:
+            validate (`bool`): 序列化前建立引用图并校验, 存在 error 级冲突时抛出
+                `ReferenceInvariantError`
+            fix (`bool`): 与`validate`配合, 先应用安全修复再校验
+            drop_dangling (`bool`): 与`fix`配合, 移除悬空引用
+        """
+        content = self._build_export_content()
+
+        if validate:
+            if fix:
+                report = fix_content(content, drop_dangling=drop_dangling)
+            else:
+                report = validate_content(content)
+            if not report.ok:
+                raise exceptions.ReferenceInvariantError(
+                    "草稿引用图不变量校验失败:\n" + report.to_json(),
+                )
+
+        return json.dumps(content, ensure_ascii=False, indent=4)
+
+    def dump(
+        self,
+        file_path: str,
+        *,
+        validate: bool = False,
+        fix: bool = False,
+        drop_dangling: bool = False,
+    ) -> None:
+        """将草稿文件内容写入文件
+
+        Args:
+            validate (`bool`): 序列化前校验引用图, 失败时抛出`ReferenceInvariantError`
+            fix (`bool`): 与`validate`配合, 先应用安全修复
+            drop_dangling (`bool`): 与`fix`配合, 移除悬空引用
+        """
         with open(file_path, "w", encoding="utf-8") as f:
-            f.write(self.dumps())
+            f.write(self.dumps(validate=validate, fix=fix, drop_dangling=drop_dangling))
 
     def save(self) -> None:
         """保存草稿文件至打开时的路径

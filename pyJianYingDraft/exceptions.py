@@ -18,6 +18,9 @@ class ExtensionFailed(ValueError):
 class DraftContentLoadFailed(ValueError):
     """草稿内容加载失败"""
 
+class ReferenceInvariantError(ValueError):
+    """序列化前引用图不变量校验失败 (悬空/重复/类型错误引用等)"""
+
 class DraftNotFound(NameError):
     """未找到草稿"""
 class AutomationError(Exception):
